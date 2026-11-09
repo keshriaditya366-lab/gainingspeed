@@ -1,0 +1,233 @@
+name: Bot Chain
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: "Comma-separated mainx*.py files. Leave EMPTY for watcher mode."
+        required: false
+        default: ""
+
+run-name: "${{ github.event.inputs.files == '' && 'watcher' || format('br:{0}', github.event.inputs.files) }}"
+
+jobs:
+  watcher:
+    if: github.event.inputs.files == ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    concurrency:
+      group: bot-chain-watcher
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Watcher
+        env:
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: "main.yml"
+          BRANCH: "main"
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -u
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions"
+
+          API="https://api.github.com/repos/$REPO"
+          HDR=( -H "Authorization: token $GH_TOKEN"
+                -H "Accept: application/vnd.github+json"
+                -H "Content-Type: application/json" )
+
+          RUN_SECONDS=$(shuf -i 18000-20700 -n 1)
+          echo "⏱  Watcher window: $RUN_SECONDS s ($((RUN_SECONDS/60)) min)"
+          START_TS=$(date +%s)
+
+          declare -A DISPATCHED_THIS_RUN
+          DISPATCHED_THIS_RUN=()
+
+          get_files_by_status() {
+            local st="$1"
+            curl -s --max-time 15 "${HDR[@]}" \
+              "$API/actions/runs?status=$st&per_page=100" 2>/dev/null \
+              | jq -r '.workflow_runs[]?
+                       | select((.display_title // "") | startswith("br:"))
+                       | (.display_title[3:])
+                       | select(length > 0)' 2>/dev/null || true
+          }
+
+          get_running_files() {
+            get_files_by_status in_progress
+            get_files_by_status queued
+          }
+
+          dispatch_files() {
+            local files="$1" http
+            http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+              -X POST "${HDR[@]}" \
+              "$API/actions/workflows/$WORKFLOW_FILE/dispatches" \
+              -d "{\"ref\":\"$BRANCH\",\"inputs\":{\"files\":\"$files\"}}")
+            if [ "$http" = "204" ]; then
+              echo "✅ Dispatched: $files"
+              IFS=',' read -ra _arr <<< "$files"
+              for _f in "${_arr[@]}"; do DISPATCHED_THIS_RUN["$_f"]=1; done
+            else
+              echo "❌ Dispatch failed for $files (HTTP $http)"
+            fi
+          }
+
+          dispatch_watcher() {
+            local http
+            http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+              -X POST "${HDR[@]}" \
+              "$API/actions/workflows/$WORKFLOW_FILE/dispatches" \
+              -d "{\"ref\":\"$BRANCH\"}")
+            [ "$http" = "204" ] \
+              && echo "✅ Next watcher queued" \
+              || echo "❌ Watcher dispatch failed (HTTP $http)"
+          }
+
+          echo "🔍 Initial scan…"
+          mapfile -t INITIAL < <(ls mainx*.py 2>/dev/null | sort -V)
+          echo "   found: ${INITIAL[*]:-<none>}"
+
+          mapfile -t RUN < <(get_running_files)
+          declare -A RUNNING_SET
+          RUNNING_SET=()
+          for chunk in "${RUN[@]:-}"; do
+            [ -z "$chunk" ] && continue
+            IFS=',' read -ra _a <<< "$chunk"
+            for _x in "${_a[@]}"; do RUNNING_SET["$_x"]=1; done
+          done
+
+          TO_DISPATCH=()
+          for f in "${INITIAL[@]:-}"; do
+            [ -z "$f" ] && continue
+            [ -n "${RUNNING_SET[$f]:-}" ] && continue
+            TO_DISPATCH+=("$f")
+          done
+
+          i=0
+          while [ $i -lt ${#TO_DISPATCH[@]} ]; do
+            a="${TO_DISPATCH[$i]}"
+            b="${TO_DISPATCH[$((i+1))]:-}"
+            if [ -n "$b" ]; then dispatch_files "$a,$b"; else dispatch_files "$a"; fi
+            i=$((i+2)); sleep 2
+          done
+
+          while true; do
+            NOW=$(date +%s); ELAPSED=$((NOW - START_TS))
+            if [ $ELAPSED -ge $RUN_SECONDS ]; then
+              echo "⏰ Watcher window done ($ELAPSED s). Restarting chain…"
+              dispatch_watcher
+              sleep 10
+              exit 0
+            fi
+
+            sleep 60
+            git pull --rebase origin "$BRANCH" --quiet 2>/dev/null || true
+
+            mapfile -t CURRENT < <(ls mainx*.py 2>/dev/null | sort -V)
+
+            CAND=()
+            for f in "${CURRENT[@]:-}"; do
+              [ -z "$f" ] && continue
+              [ -n "${DISPATCHED_THIS_RUN[$f]:-}" ] && continue
+              [ -n "${RUNNING_SET[$f]:-}" ] && continue
+              CAND+=("$f")
+            done
+
+            mapfile -t RUN2 < <(get_running_files)
+            for chunk in "${RUN2[@]:-}"; do
+              [ -z "$chunk" ] && continue
+              IFS=',' read -ra _a <<< "$chunk"
+              for _x in "${_a[@]}"; do RUNNING_SET["$_x"]=1; done
+            done
+
+            ACTUAL=()
+            for f in "${CAND[@]:-}"; do
+              [ -n "${RUNNING_SET[$f]:-}" ] && continue
+              ACTUAL+=("$f")
+            done
+
+            if [ ${#ACTUAL[@]} -gt 0 ]; then
+              echo "🆕 New files: ${ACTUAL[*]}"
+              j=0
+              while [ $j -lt ${#ACTUAL[@]} ]; do
+                a="${ACTUAL[$j]}"
+                b="${ACTUAL[$((j+1))]:-}"
+                if [ -n "$b" ]; then dispatch_files "$a,$b"; else dispatch_files "$a"; fi
+                j=$((j+2)); sleep 2
+              done
+            fi
+          done
+
+  file-runner:
+    if: github.event.inputs.files != ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    concurrency:
+      group: bot-chain-runner-${{ github.event.inputs.files }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests psutil python-telegram-bot igrapiweb
+          python -m playwright install --with-deps chromium
+      - name: Run Files
+        env:
+          FILES: ${{ github.event.inputs.files }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: "main.yml"
+          BRANCH: "main"
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+        run: |
+          set -u
+          [ -z "$FILES" ] && { echo "No files passed."; exit 0; }
+          IFS=',' read -ra FILE_ARR <<< "$FILES"
+          echo "📦 Runner will host: ${FILE_ARR[*]}"
+
+          SUBSHELL_PIDS=()
+          cleanup() {
+            set +e
+            for f in "${FILE_ARR[@]}"; do
+              pkill -9 -f "python -u $f" 2>/dev/null
+            done
+            for sp in "${SUBSHELL_PIDS[@]}"; do
+              kill -9 "$sp" 2>/dev/null
+            done
+          }
+          trap cleanup EXIT INT TERM
+
+          for f in "${FILE_ARR[@]}"; do
+            ( while true; do
+                python -u "$f" || true
+                echo "⚠️  $f exited. Restart in 5s…"
+                sleep 5
+              done ) &
+            SUBSHELL_PIDS+=($!)
+          done
+
+          RUN_SECONDS=$(shuf -i 18000-20700 -n 1)
+          echo "⏱  File-runner window: $RUN_SECONDS s ($((RUN_SECONDS/60)) min)"
+          sleep "$RUN_SECONDS"
+
+          echo "🔄 Dispatching self-restart for: $FILES"
+          http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
+            -d "{\"ref\":\"$BRANCH\",\"inputs\":{\"files\":\"$FILES\"}}")
+
+          if [ "$http" = "204" ]; then
+            echo "✅ Self-restart dispatched"
+          else
+            echo "❌ Self-restart failed (HTTP $http)"
+          fi
+          sleep 10
+          exit 0
