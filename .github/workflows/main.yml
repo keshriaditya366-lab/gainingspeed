@@ -3,6 +3,11 @@ name: Bot Chain
 on:
   workflow_dispatch:
 
+# FIXED: Native GitHub concurrency. Automatically kills older runs.
+concurrency:
+  group: bot-chain-global
+  cancel-in-progress: true
+
 jobs:
   # ─────────────────────────────────────────────────────────────
   # 1. SETUP: Finds files and creates the runner groups
@@ -59,21 +64,20 @@ jobs:
       - name: Install
         run: |
           pip install playwright requests psutil python-telegram-bot igrapiweb
-          python -m playwright install --with-deps chromium
-          python -m playwright install chrome
-          python -m playwright install msedge
+          python -m playwright install --with-deps
       - name: Run Files with Deletion Monitor
         env:
           FILES: ${{ matrix.files }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
         run: |
-          # AGGRESSIVE TRAP: Force kills all python and browser processes instantly
           cleanup() {
-            echo "🛑 Shutdown signal received. Force killing all bots and browsers..."
-            pkill -9 -f "python" 2>/dev/null || true
-            pkill -9 -f "playwright" 2>/dev/null || true
+            echo "🛑 Shutdown signal received. Force killing all bots..."
+            for f in "${FILE_ARR[@]}"; do
+              pkill -9 -f "$f" 2>/dev/null || true
+            done
             pkill -9 -f "chrome" 2>/dev/null || true
             pkill -9 -f "msedge" 2>/dev/null || true
+            pkill -9 -f "playwright" 2>/dev/null || true
             exit 0
           }
           trap cleanup EXIT INT TERM
@@ -92,7 +96,6 @@ jobs:
           
           while true; do
             sleep 60
-            # Sync with repo and clean up untracked files
             git fetch origin main -q && git reset --hard origin/main -q && git clean -fdx -q
             
             for f in "${!BOT_PIDS[@]}"; do
@@ -104,26 +107,23 @@ jobs:
               fi
             done
             
-            # If all files are deleted, exit gracefully
             [ ${#BOT_PIDS[@]} -eq 0 ] && { echo "✅ All files deleted."; exit 0; }
           done
 
   # ─────────────────────────────────────────────────────────────
-  # 3. WATCHER: Monitors for new files and Safe Handoff
+  # 3. WATCHER: Monitors, cleans up old runs, and hands off safely
   # ─────────────────────────────────────────────────────────────
   watcher:
     needs: setup
     runs-on: ubuntu-22.04
     timeout-minutes: 360
-    concurrency:
-      group: bot-watcher
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - name: Watch Repo
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
         run: |
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
@@ -140,26 +140,40 @@ jobs:
             ELAPSED=$(( $(date +%s) - START_TS ))
             
             if [ "$CURRENT_HASH" != "$INITIAL_HASH" ] || [ "$ELAPSED" -ge "$RUN_SECONDS" ]; then
-              echo "🔄 Change detected or timer expired. Handing off..."
+              echo "🔄 Change detected or timer expired. Starting Handoff Protocol..."
               break
             fi
           done
 
-          # SAFE HANDOFF
-          echo "Dispatching new run..."
+          # ─────────────────────────────────────────────────────────────
+          # MASS CLEANUP & SAFE HANDOFF
+          # ─────────────────────────────────────────────────────────────
+          echo "🧹 Cleaning up ALL active runs (except current)..."
+          
+          # Find all queued or in_progress runs in the repo
+          ACTIVE_RUNS=$(gh run list --limit 50 --json databaseId,status --jq ".[] | select(.databaseId != $RUN_ID) | select(.status == \"queued\" or .status == \"in_progress\") | .databaseId")
+          
+          for rid in $ACTIVE_RUNS; do
+            echo "🛑 Cancelling old run: $rid"
+            # Standard cancel first
+            gh run cancel "$rid" 2>/dev/null || true
+            # Force cancel via API if standard fails (bypasses queued stuck state)
+            gh api -X POST "repos/$REPO/actions/runs/$rid/force-cancel" 2>/dev/null || true
+          done
+
+          echo "🚀 Dispatching fresh run..."
           gh workflow run main.yml --ref main
 
-          echo "⏳ Waiting for new run to register in API..."
+          echo "⏳ Waiting for new run to register..."
           NEW_RUN_ID=""
-          
           for i in {1..10}; do
             sleep 10
-            NEW_RUN_ID=$(gh run list --workflow main.yml --limit 10 --json databaseId,status --jq ".[] | select(.databaseId != ${RUN_ID}) | select(.status == \"queued\" or .status == \"in_progress\") | .databaseId" | head -n 1)
+            NEW_RUN_ID=$(gh run list --workflow main.yml --limit 5 --json databaseId,status --jq ".[] | select(.databaseId != $RUN_ID) | select(.status == \"queued\" or .status == \"in_progress\") | .databaseId" | head -n 1)
             if [ -n "$NEW_RUN_ID" ]; then break; fi
           done
 
           if [ -z "$NEW_RUN_ID" ]; then
-            echo "❌ Failed to find new run in API after 100s. Aborting kill to save old run."
+            echo "❌ Failed to find new run in API. Aborting."
             exit 1
           fi
 
@@ -169,9 +183,9 @@ jobs:
           STATUS=$(gh run view "$NEW_RUN_ID" --json status --jq '.status')
 
           if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
-            echo "💀 New run healthy. Issuing kill command to all old runners..."
-            # This cancels the entire old run. The trap in run-bots will instantly kill all python/chrome processes.
-            gh run cancel "$RUN_ID"
+            echo "💀 New run is healthy. Killing current watcher run ($RUN_ID)..."
+            gh run cancel "$RUN_ID" || true
+            gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/force-cancel" || true
             exit 0
           else
             echo "❌ New run died instantly. Old run preserved."
