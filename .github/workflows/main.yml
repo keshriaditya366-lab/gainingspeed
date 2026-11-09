@@ -38,8 +38,8 @@ jobs:
             fi
           done
 
-          # Convert to JSON array for Matrix
-          JSON_ARRAY=$(printf '%s\n' "${PAIRS[@]}" | jq -R . | jq -s .)
+          # Convert to JSON array for Matrix (-c flag forces single-line output)
+          JSON_ARRAY=$(printf '%s\n' "${PAIRS[@]}" | jq -R . | jq -s -c .)
           echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
           echo "Matrix created: $JSON_ARRAY"
 
