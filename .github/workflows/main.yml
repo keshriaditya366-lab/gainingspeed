@@ -17,17 +17,13 @@ jobs:
       - id: set-matrix
         run: |
           FILES=( $(ls mainx*.py 2>/dev/null | sort -V) )
-          
           if [ ${#FILES[@]} -eq 0 ]; then
             echo "matrix=[]" >> $GITHUB_OUTPUT
             echo "has_files=false" >> $GITHUB_OUTPUT
-            echo "No files found yet. Waiting..."
             exit 0
           fi
 
           echo "has_files=true" >> $GITHUB_OUTPUT
-          echo "Found ${#FILES[@]} files. Grouping into pairs..."
-
           PAIRS=()
           for ((i=0; i<${#FILES[@]}; i+=2)); do
             if [ -n "${FILES[$((i+1))]}" ]; then
@@ -39,10 +35,9 @@ jobs:
 
           JSON_ARRAY=$(printf '%s\n' "${PAIRS[@]}" | jq -R . | jq -s -c .)
           echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
-          echo "Matrix created: $JSON_ARRAY"
 
   # ─────────────────────────────────────────────────────────────
-  # 2. RUN-BOTS: Spawns 1 runner per group
+  # 2. RUN-BOTS: Spawns runners and monitors for file deletions
   # ─────────────────────────────────────────────────────────────
   run-bots:
     needs: setup
@@ -63,29 +58,48 @@ jobs:
           python-version: '3.11'
       - name: Install
         run: |
-          python -m pip install --upgrade pip
           pip install playwright requests psutil python-telegram-bot igrapiweb
           python -m playwright install --with-deps chromium
-      - name: Run Files
+      - name: Run Files with Deletion Monitor
         env:
           FILES: ${{ matrix.files }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
         run: |
-          IFS=',' read -ra FILE_ARR <<< "$FILES"
-          echo "📦 This runner is hosting: ${FILE_ARR[*]}"
+          # Lightweight trap: kills the script AND all python child processes instantly
+          trap 'kill 0' EXIT INT TERM
           
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          
+          IFS=',' read -ra FILE_ARR <<< "$FILES"
+          echo "📦 Hosting: ${FILE_ARR[*]}"
+          
+          declare -A BOT_PIDS
           for f in "${FILE_ARR[@]}"; do
-            ( while true; do
-                python -u "$f" || true
-                echo "⚠️ $f exited. Restarting in 5s..."
-                sleep 5
-              done ) &
+            ( while true; do python -u "$f" || true; sleep 5; done ) &
+            BOT_PIDS["$f"]=$!
           done
           
-          wait
+          while true; do
+            sleep 60
+            # Sync with repo and clean up untracked files (prevents disk space crash)
+            git fetch origin main -q && git reset --hard origin/main -q && git clean -fdx -q
+            
+            for f in "${!BOT_PIDS[@]}"; do
+              if [ ! -f "$f" ]; then
+                echo "🗑️ $f deleted! Killing process..."
+                kill -9 "${BOT_PIDS[$f]}" 2>/dev/null || true
+                pkill -9 -f "python -u $f" 2>/dev/null || true
+                unset BOT_PIDS["$f"]
+              fi
+            done
+            
+            # If all files are deleted, exit gracefully
+            [ ${#BOT_PIDS[@]} -eq 0 ] && { echo "✅ All files deleted."; exit 0; }
+          done
 
   # ─────────────────────────────────────────────────────────────
-  # 3. WATCHER: Monitors for new files and Aggressive Kill Loop
+  # 3. WATCHER: Monitors for new files and Safe Handoff
   # ─────────────────────────────────────────────────────────────
   watcher:
     needs: setup
@@ -99,110 +113,64 @@ jobs:
       - name: Watch Repo
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          REPO: ${{ github.repository }}
-          WORKFLOW_FILE: "main.yml"
-          BRANCH: "main"
           RUN_ID: ${{ github.run_id }}
         run: |
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
 
+          # Track hashes to detect additions OR file content edits
           INITIAL_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
-          
           RUN_SECONDS=$(shuf -i 18000-20700 -n 1)
           START_TS=$(date +%s)
-          echo "⏱ Watcher window: $RUN_SECONDS s ($((RUN_SECONDS/60)) min)"
 
           while true; do
             sleep 60
-            NOW=$(date +%s)
-            ELAPSED=$((NOW - START_TS))
-
-            git pull origin "$BRANCH" --rebase --quiet 2>/dev/null || true
+            git fetch origin main -q && git reset --hard origin/main -q
+            
             CURRENT_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
-
-            if [ "$CURRENT_HASH" != "$INITIAL_HASH" ]; then
-              echo "🆕 New file detected! Breaking loop for INSTANT handoff..."
-              break
-            fi
-
-            if [ "$ELAPSED" -ge "$RUN_SECONDS" ]; then
-              echo "⏰ Time window expired! Initiating handoff..."
+            ELAPSED=$(( $(date +%s) - START_TS ))
+            
+            if [ "$CURRENT_HASH" != "$INITIAL_HASH" ] || [ "$ELAPSED" -ge "$RUN_SECONDS" ]; then
+              echo "🔄 Change detected or timer expired. Handing off..."
               break
             fi
           done
 
           # ─────────────────────────────────────────────────────────────
-          # SAFE HANDOFF PROTOCOL (With Aggressive Kill Loop)
+          # SAFE HANDOFF using gh CLI (Race condition fixed)
           # ─────────────────────────────────────────────────────────────
-          echo "🔄 Starting Handoff Protocol..."
-          DISPATCH_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Dispatching new run..."
+          gh workflow run main.yml --ref main
 
-          while true; do
-            echo "Dispatching new run..."
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-              -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
-              -d "{\"ref\":\"$BRANCH\"}")
-
-            if [ "$HTTP" != "204" ]; then
-              echo "❌ Dispatch failed (HTTP $HTTP). Retrying in 60s..."
-              sleep 60
-              continue
-            fi
-
-            echo "⏳ Dispatch successful. Waiting 15s for GitHub to register the run..."
-            sleep 15
-
-            NEW_RUN_ID=$(curl -s -H "Authorization: token $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/actions/runs?created=>$DISPATCH_TIME" | \
-              jq -r --arg cur "$RUN_ID" '.workflow_runs[] | select(.id|tostring != $cur) | .id' | head -n 1)
-
-            if [ -z "$NEW_RUN_ID" ] || [ "$NEW_RUN_ID" = "null" ]; then
-              echo "❌ Could not find the new run. Retrying in 60s..."
-              sleep 60
-              continue
-            fi
-
-            echo "✅ Found new run ID: $NEW_RUN_ID. Waiting 60s to ensure it survives startup..."
-            sleep 60
-
-            STATUS=$(curl -s -H "Authorization: token $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/actions/runs/$NEW_RUN_ID" | jq -r .status)
-
-            if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
-              echo "✅ New run is alive and healthy (Status: $STATUS)."
-              
-              # ── THE AGGRESSIVE KILL LOOP ──
-              echo "🛑 Terminating old workflow run ($RUN_ID)..."
-              while true; do
-                # Send kill command
-                curl -s -o /dev/null -X POST \
-                  -H "Authorization: token $GH_TOKEN" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel"
-                
-                echo "⏳ Kill command sent. Waiting 10s to verify termination..."
-                sleep 10
-                
-                # Check old run status
-                OLD_STATUS=$(curl -s -H "Authorization: token $GH_TOKEN" \
-                  "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID" | jq -r .status)
-                
-                if [ "$OLD_STATUS" = "completed" ] || [ "$OLD_STATUS" = "cancelled" ]; then
-                  echo "💀 Old workflow successfully terminated! (Status: $OLD_STATUS)"
-                  break
-                else
-                  echo "⚠️ Old workflow is still $OLD_STATUS! Re-sending kill command..."
-                fi
-              done
-              
-              sleep 5
-              exit 0
-              
-            else
-              echo "❌ New run died during startup (Status: $STATUS). Retrying in 60s..."
-              sleep 60
+          echo "⏳ Waiting for new run to register in API..."
+          NEW_RUN_ID=""
+          
+          # Loop for 100 seconds to safely find the new run
+          for i in {1..10}; do
+            sleep 10
+            # Find a run that is NOT the current one and is actively queueing/running
+            NEW_RUN_ID=$(gh run list --workflow main.yml --limit 10 --json databaseId,status --jq ".[] | select(.databaseId != ${RUN_ID}) | select(.status == \"queued\" or .status == \"in_progress\") | .databaseId" | head -n 1)
+            
+            if [ -n "$NEW_RUN_ID" ]; then
+              break
             fi
           done
+
+          if [ -z "$NEW_RUN_ID" ]; then
+            echo "❌ Failed to find new run in API after 100s. Aborting kill to save old run."
+            exit 1
+          fi
+
+          echo "✅ New run ($NEW_RUN_ID) registered. Waiting 60s health check..."
+          sleep 60
+          
+          STATUS=$(gh run view "$NEW_RUN_ID" --json status --jq '.status')
+
+          if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
+            echo "💀 New run healthy. Killing old run ($RUN_ID)..."
+            gh run cancel "$RUN_ID"
+            exit 0
+          else
+            echo "❌ New run died instantly. Old run preserved."
+            exit 1
+          fi
