@@ -28,7 +28,6 @@ jobs:
           echo "has_files=true" >> $GITHUB_OUTPUT
           echo "Found ${#FILES[@]} files. Grouping into pairs..."
 
-          # Group files by 2s
           PAIRS=()
           for ((i=0; i<${#FILES[@]}; i+=2)); do
             if [ -n "${FILES[$((i+1))]}" ]; then
@@ -38,7 +37,6 @@ jobs:
             fi
           done
 
-          # Convert to JSON array for Matrix (-c flag forces single-line output)
           JSON_ARRAY=$(printf '%s\n' "${PAIRS[@]}" | jq -R . | jq -s -c .)
           echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
           echo "Matrix created: $JSON_ARRAY"
@@ -84,11 +82,10 @@ jobs:
               done ) &
           done
           
-          # Keep the job alive
           wait
 
   # ─────────────────────────────────────────────────────────────
-  # 3. WATCHER: Monitors for new files and Safe Handoff
+  # 3. WATCHER: Monitors for new files and Aggressive Kill Loop
   # ─────────────────────────────────────────────────────────────
   watcher:
     needs: setup
@@ -110,7 +107,6 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
 
-          # Create a hash of all current file names
           INITIAL_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
           
           RUN_SECONDS=$(shuf -i 18000-20700 -n 1)
@@ -122,14 +118,11 @@ jobs:
             NOW=$(date +%s)
             ELAPSED=$((NOW - START_TS))
 
-            # Fetch latest changes from repo
             git pull origin "$BRANCH" --rebase --quiet 2>/dev/null || true
-            
-            # Check if files changed (added, deleted, or renamed)
             CURRENT_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
 
             if [ "$CURRENT_HASH" != "$INITIAL_HASH" ]; then
-              echo "🆕 File change detected! Initiating handoff..."
+              echo "🆕 New file detected! Breaking loop for INSTANT handoff..."
               break
             fi
 
@@ -140,7 +133,7 @@ jobs:
           done
 
           # ─────────────────────────────────────────────────────────────
-          # SAFE HANDOFF PROTOCOL
+          # SAFE HANDOFF PROTOCOL (With Aggressive Kill Loop)
           # ─────────────────────────────────────────────────────────────
           echo "🔄 Starting Handoff Protocol..."
           DISPATCH_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -162,7 +155,6 @@ jobs:
             echo "⏳ Dispatch successful. Waiting 15s for GitHub to register the run..."
             sleep 15
 
-            # Look for runs created strictly after DISPATCH_TIME
             NEW_RUN_ID=$(curl -s -H "Authorization: token $GH_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/runs?created=>$DISPATCH_TIME" | \
               jq -r --arg cur "$RUN_ID" '.workflow_runs[] | select(.id|tostring != $cur) | .id' | head -n 1)
@@ -176,21 +168,39 @@ jobs:
             echo "✅ Found new run ID: $NEW_RUN_ID. Waiting 60s to ensure it survives startup..."
             sleep 60
 
-            # Check status of new run
             STATUS=$(curl -s -H "Authorization: token $GH_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/runs/$NEW_RUN_ID" | jq -r .status)
 
             if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
               echo "✅ New run is alive and healthy (Status: $STATUS)."
-              echo "🛑 Killing current run ($RUN_ID)..."
               
-              curl -s -o /dev/null -w "Cancel HTTP: %{http_code}\n" -X POST \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel"
+              # ── THE AGGRESSIVE KILL LOOP ──
+              echo "🛑 Terminating old workflow run ($RUN_ID)..."
+              while true; do
+                # Send kill command
+                curl -s -o /dev/null -X POST \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel"
+                
+                echo "⏳ Kill command sent. Waiting 10s to verify termination..."
+                sleep 10
+                
+                # Check old run status
+                OLD_STATUS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                  "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID" | jq -r .status)
+                
+                if [ "$OLD_STATUS" = "completed" ] || [ "$OLD_STATUS" = "cancelled" ]; then
+                  echo "💀 Old workflow successfully terminated! (Status: $OLD_STATUS)"
+                  break
+                else
+                  echo "⚠️ Old workflow is still $OLD_STATUS! Re-sending kill command..."
+                fi
+              done
               
               sleep 5
               exit 0
+              
             else
               echo "❌ New run died during startup (Status: $STATUS). Retrying in 60s..."
               sleep 60
