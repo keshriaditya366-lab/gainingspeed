@@ -60,13 +60,23 @@ jobs:
         run: |
           pip install playwright requests psutil python-telegram-bot igrapiweb
           python -m playwright install --with-deps chromium
+          python -m playwright install chrome
+          python -m playwright install msedge
       - name: Run Files with Deletion Monitor
         env:
           FILES: ${{ matrix.files }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
         run: |
-          # Lightweight trap: kills the script AND all python child processes instantly
-          trap 'kill 0' EXIT INT TERM
+          # AGGRESSIVE TRAP: Force kills all python and browser processes instantly
+          cleanup() {
+            echo "🛑 Shutdown signal received. Force killing all bots and browsers..."
+            pkill -9 -f "python" 2>/dev/null || true
+            pkill -9 -f "playwright" 2>/dev/null || true
+            pkill -9 -f "chrome" 2>/dev/null || true
+            pkill -9 -f "msedge" 2>/dev/null || true
+            exit 0
+          }
+          trap cleanup EXIT INT TERM
           
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
@@ -82,7 +92,7 @@ jobs:
           
           while true; do
             sleep 60
-            # Sync with repo and clean up untracked files (prevents disk space crash)
+            # Sync with repo and clean up untracked files
             git fetch origin main -q && git reset --hard origin/main -q && git clean -fdx -q
             
             for f in "${!BOT_PIDS[@]}"; do
@@ -118,7 +128,6 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
 
-          # Track hashes to detect additions OR file content edits
           INITIAL_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
           RUN_SECONDS=$(shuf -i 18000-20700 -n 1)
           START_TS=$(date +%s)
@@ -136,24 +145,17 @@ jobs:
             fi
           done
 
-          # ─────────────────────────────────────────────────────────────
-          # SAFE HANDOFF using gh CLI (Race condition fixed)
-          # ─────────────────────────────────────────────────────────────
+          # SAFE HANDOFF
           echo "Dispatching new run..."
           gh workflow run main.yml --ref main
 
           echo "⏳ Waiting for new run to register in API..."
           NEW_RUN_ID=""
           
-          # Loop for 100 seconds to safely find the new run
           for i in {1..10}; do
             sleep 10
-            # Find a run that is NOT the current one and is actively queueing/running
             NEW_RUN_ID=$(gh run list --workflow main.yml --limit 10 --json databaseId,status --jq ".[] | select(.databaseId != ${RUN_ID}) | select(.status == \"queued\" or .status == \"in_progress\") | .databaseId" | head -n 1)
-            
-            if [ -n "$NEW_RUN_ID" ]; then
-              break
-            fi
+            if [ -n "$NEW_RUN_ID" ]; then break; fi
           done
 
           if [ -z "$NEW_RUN_ID" ]; then
@@ -167,7 +169,8 @@ jobs:
           STATUS=$(gh run view "$NEW_RUN_ID" --json status --jq '.status')
 
           if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
-            echo "💀 New run healthy. Killing old run ($RUN_ID)..."
+            echo "💀 New run healthy. Issuing kill command to all old runners..."
+            # This cancels the entire old run. The trap in run-bots will instantly kill all python/chrome processes.
             gh run cancel "$RUN_ID"
             exit 0
           else
